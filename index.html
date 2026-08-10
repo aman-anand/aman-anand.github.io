@@ -246,98 +246,199 @@
   });
   </script>
 
-  <!-- Three.js immersive module (procedural mesh + bloom) -->
+  <!-- Three.js immersive module: lazy-load, glTF model, mobile optimizations -->
   <script type="module">
-  import * as THREE from 'https://unpkg.com/three@0.158.0/build/three.module.js';
-  import { OrbitControls } from 'https://unpkg.com/three@0.158.0/examples/jsm/controls/OrbitControls.js';
-  import { EffectComposer } from 'https://unpkg.com/three@0.158.0/examples/jsm/postprocessing/EffectComposer.js';
-  import { RenderPass } from 'https://unpkg.com/three@0.158.0/examples/jsm/postprocessing/RenderPass.js';
-  import { UnrealBloomPass } from 'https://unpkg.com/three@0.158.0/examples/jsm/postprocessing/UnrealBloomPass.js';
+  // Defer heavy 3D work until idle or first interaction
+  const MODEL_URL = 'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/BoomBox/glTF-Binary/BoomBox.glb';
 
   const wrap = document.getElementById('three-wrap');
-  const scene = new THREE.Scene();
-  scene.fog = new THREE.FogExp2(0x071126, 0.0025);
 
-  const camera = new THREE.PerspectiveCamera(40, wrap.clientWidth / wrap.clientHeight, 0.1, 2000);
-  camera.position.set(0, 0.8, 3);
+  // Basic low-power detection
+  const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+  const saveData = navigator.connection ? navigator.connection.saveData : false;
+  const effectiveType = connection && connection.effectiveType ? connection.effectiveType : '4g';
+  const isSlow = saveData || /2g|slow-2g/.test(effectiveType);
 
-  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  renderer.setSize(wrap.clientWidth, wrap.clientHeight);
-  wrap.appendChild(renderer.domElement);
+  // Hold renderer state globally to allow cleanup
+  let renderer, scene, camera, composer, controls, mesh, animationId;
 
-  const dir = new THREE.DirectionalLight(0xffffff, 0.6);
-  dir.position.set(5, 10, 7);
-  scene.add(dir);
-  const amb = new THREE.AmbientLight(0xffffff, 0.2);
-  scene.add(amb);
+  async function init3D() {
+    // dynamic imports
+    const [{ default: THREE }, { OrbitControls }, { EffectComposer }, { RenderPass }, { UnrealBloomPass }, { GLTFLoader }] = await Promise.all([
+      import('https://unpkg.com/three@0.158.0/build/three.module.js'),
+      import('https://unpkg.com/three@0.158.0/examples/jsm/controls/OrbitControls.js'),
+      import('https://unpkg.com/three@0.158.0/examples/jsm/postprocessing/EffectComposer.js'),
+      import('https://unpkg.com/three@0.158.0/examples/jsm/postprocessing/RenderPass.js'),
+      import('https://unpkg.com/three@0.158.0/examples/jsm/postprocessing/UnrealBloomPass.js'),
+      import('https://unpkg.com/three@0.158.0/examples/jsm/loaders/GLTFLoader.js')
+    ]).catch(err => {
+      console.warn('3D modules failed to load', err);
+      return [];
+    });
 
-  const geo = new THREE.IcosahedronGeometry(1.15, 5);
-  const mat = new THREE.MeshStandardMaterial({
-    color: 0x06b6d4,
-    roughness: 0.2,
-    metalness: 0.7,
-    emissive: 0x07343f,
-    emissiveIntensity: 0.4
-  });
-  const mesh = new THREE.Mesh(geo, mat);
-  scene.add(mesh);
+    if (!THREE) return renderFallback();
 
-  const controls = new OrbitControls(camera, renderer.domElement);
-  controls.enableDamping = true;
-  controls.enablePan = false;
-  controls.autoRotate = false;
-  controls.minDistance = 1.6;
-  controls.maxDistance = 6;
+    scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x071126, 0.0025);
 
-  const composer = new EffectComposer(renderer);
-  composer.addPass(new RenderPass(scene, camera));
-  const bloomPass = new UnrealBloomPass(new THREE.Vector2(wrap.clientWidth, wrap.clientHeight), 0.8, 0.2, 0.9);
-  bloomPass.threshold = 0.1;
-  bloomPass.strength = 0.9;
-  bloomPass.radius = 0.5;
-  composer.addPass(bloomPass);
+    camera = new THREE.PerspectiveCamera(40, wrap.clientWidth / wrap.clientHeight, 0.1, 2000);
+    camera.position.set(0, 0.8, 3);
 
-  let mouse = { x: 0, y: 0 };
-  wrap.addEventListener('pointermove', (e) => {
-    const rect = wrap.getBoundingClientRect();
-    mouse.x = ( (e.clientX - rect.left) / rect.width ) * 2 - 1;
-    mouse.y = - ( (e.clientY - rect.top) / rect.height ) * 2 + 1;
-  });
-
-  function resize() {
-    camera.aspect = wrap.clientWidth / wrap.clientHeight;
-    camera.updateProjectionMatrix();
+    renderer = new THREE.WebGLRenderer({ antialias: !isSlow, alpha: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, isSlow ? 1 : 2));
     renderer.setSize(wrap.clientWidth, wrap.clientHeight);
-    composer.setSize(wrap.clientWidth, wrap.clientHeight);
-  }
-  window.addEventListener('resize', resize);
+    renderer.outputEncoding = THREE.sRGBEncoding;
+    wrap.appendChild(renderer.domElement);
 
-  const clock = new THREE.Clock();
-  function animate() {
-    requestAnimationFrame(animate);
-    const t = clock.getElapsedTime();
+    // Lights
+    const dir = new THREE.DirectionalLight(0xffffff, 0.6);
+    dir.position.set(5, 10, 7);
+    scene.add(dir);
+    const amb = new THREE.AmbientLight(0xffffff, 0.2);
+    scene.add(amb);
 
-    mesh.rotation.y = 0.15 * t + mouse.x * 0.5;
-    mesh.rotation.x = mouse.y * 0.25;
-    mesh.material.emissiveIntensity = 0.35 + Math.sin(t * 0.6) * 0.15;
+    // Controls
+    controls = new OrbitControls.OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.enablePan = false;
+    controls.autoRotate = false;
+    controls.minDistance = 1.6;
+    controls.maxDistance = 6;
 
-    const pos = mesh.geometry.attributes.position;
-    for (let i = 0; i < pos.count; i++) {
-      const ix = i * 3;
-      pos.array[ix + 1] = pos.array[ix + 1] + Math.sin(t + i) * 0.0002;
+    // Post-processing only for non-slow connections / desktops
+    if (!isSlow) {
+      composer = new EffectComposer.EffectComposer(renderer);
+      composer.addPass(new RenderPass.RenderPass(scene, camera));
+      const bloomPass = new UnrealBloomPass.UnrealBloomPass(new THREE.Vector2(wrap.clientWidth, wrap.clientHeight), 0.6, 0.15, 0.45);
+      bloomPass.threshold = 0.1;
+      bloomPass.strength = 0.8;
+      bloomPass.radius = 0.4;
+      composer.addPass(bloomPass);
     }
-    pos.needsUpdate = true;
 
-    controls.update();
-    composer.render();
+    // Add a subtle environment (ground plane reflection via subtle hemisphere)
+    const hemi = new THREE.HemisphereLight(0x445566, 0x0a0a0a, 0.2);
+    scene.add(hemi);
+
+    // Start with a lightweight placeholder geometry while the glTF loads
+    const placeholderGeo = new THREE.IcosahedronGeometry(1.0, 3);
+    const placeholderMat = new THREE.MeshStandardMaterial({ color: 0x06b6d4, roughness: 0.25, metalness: 0.6, emissive: 0x071826, emissiveIntensity: 0.4 });
+    mesh = new THREE.Mesh(placeholderGeo, placeholderMat);
+    scene.add(mesh);
+
+    // Load glTF model (deferred, with progress) - falls back to placeholder on failure
+    try {
+      const loader = new GLTFLoader.GLTFLoader();
+      // If you add Draco-compressed models in the future, wire DRACOLoader here.
+
+      const gltf = await new Promise((resolve, reject) => {
+        loader.load(MODEL_URL, resolve, (xhr) => {
+          // progress indicator (console only)
+          // console.log('model', (xhr.loaded / xhr.total * 100).toFixed(0) + '%');
+        }, reject);
+      });
+
+      // Remove placeholder and add model
+      scene.remove(mesh);
+      mesh.geometry?.dispose?.();
+      mesh.material?.dispose?.();
+
+      const model = gltf.scene || gltf.scenes[0];
+      model.traverse((n) => {
+        if (n.isMesh) {
+          n.castShadow = true;
+          n.receiveShadow = true;
+          if (n.material) {
+            // tweak materials for consistency
+            n.material.metalness = n.material.metalness ?? 0.5;
+            n.material.roughness = n.material.roughness ?? 0.4;
+          }
+        }
+      });
+
+      // scale & center model to fit the view
+      const box = new THREE.Box3().setFromObject(model);
+      const size = new THREE.Vector3();
+      box.getSize(size);
+      const maxDim = Math.max(size.x, size.y, size.z);
+      const scale = 1.5 / maxDim;
+      model.scale.setScalar(scale);
+      box.setFromObject(model);
+      box.getCenter(size);
+      model.position.sub(size);
+
+      scene.add(model);
+      mesh = model;
+
+    } catch (err) {
+      console.warn('glTF model failed to load, using placeholder', err);
+      // Keep placeholder
+    }
+
+    // Interaction
+    let mouse = { x: 0, y: 0 };
+    wrap.addEventListener('pointermove', (e) => {
+      const rect = wrap.getBoundingClientRect();
+      mouse.x = ( (e.clientX - rect.left) / rect.width ) * 2 - 1;
+      mouse.y = - ( (e.clientY - rect.top) / rect.height ) * 2 + 1;
+    });
+
+    function resize() {
+      if (!camera || !renderer) return;
+      camera.aspect = wrap.clientWidth / wrap.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(wrap.clientWidth, wrap.clientHeight);
+      if (composer) composer.setSize(wrap.clientWidth, wrap.clientHeight);
+    }
+    window.addEventListener('resize', resize);
+
+    // Animation loop
+    const clock = new THREE.Clock();
+    function animate() {
+      animationId = requestAnimationFrame(animate);
+      const t = clock.getElapsedTime();
+
+      if (mesh) {
+        mesh.rotation.y = 0.08 * t + mouse.x * 0.4;
+        mesh.rotation.x = mouse.y * 0.2;
+      }
+
+      controls.update();
+      if (composer) composer.render(); else renderer.render(scene, camera);
+    }
+    animate();
+
+    // Cleanup on pagehide to save memory
+    window.addEventListener('pagehide', () => {
+      cancelAnimationFrame(animationId);
+      try { renderer?.dispose(); } catch (e) {}
+      try { composer?.dispose(); } catch (e) {}
+      wrap.innerHTML = '';
+    }, { once: true });
   }
-  animate();
 
-  if (/Mobi|Android/i.test(navigator.userAgent)) {
-    bloomPass.strength = 0.2;
-    renderer.setPixelRatio(1);
-    composer.setSize(wrap.clientWidth, wrap.clientHeight);
+  function renderFallback() {
+    // Render a simple CSS gradient or static SVG to keep visual interest
+    wrap.innerHTML = '<div style="padding:36px;color:var(--muted);font-size:15px">Interactive 3D is unavailable — a static hero is shown instead.</div>';
+  }
+
+  // Start loading when the page is idle or on first interaction to avoid blocking
+  if ('requestIdleCallback' in window && !/Mobi|Android/i.test(navigator.userAgent)) {
+    requestIdleCallback(() => init3D(), { timeout: 2000 });
+  } else {
+    // For mobile or older browsers, wait for a short timeout and then init (unless connection is very slow)
+    if (!isSlow) {
+      setTimeout(() => init3D(), 800);
+    } else {
+      // very slow connections: show a static fallback and allow user to load on demand
+      renderFallback();
+      const btn = document.createElement('button');
+      btn.textContent = 'Load interactive demo';
+      btn.className = 'btn';
+      btn.style.margin = '16px';
+      btn.onclick = () => { btn.remove(); init3D(); };
+      wrap.appendChild(btn);
+    }
   }
   </script>
 
